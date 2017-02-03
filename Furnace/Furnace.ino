@@ -16,9 +16,11 @@
   
 //#define BUTTON_PIN   PB8
 #define HEAT_PIN     3
+#define BUTTON_PIN   4
 
 #include <MySensors.h>
 #include <SPI.h>
+#include <Bounce2.h>
 
 #define FURNACE_CHILD  0
 #define CONFIG_CHILD 3
@@ -29,6 +31,8 @@
 #define EEPROM_OFFDELAY 5 //needs 1 byte
 #define EEPROM_RUNTIME  6 //needs 3 bytes
 
+#define BUTTON_HOLD_TIME 5000 //5sec
+
 
 MyMessage stateMsg(FURNACE_CHILD, V_STATUS);
 MyMessage gallonsMsg(FURNACE_CHILD, V_VOLUME);
@@ -38,6 +42,9 @@ MyMessage gphMsg(CONFIG_CHILD, V_VAR2);
 MyMessage turnOnDelayMsg(CONFIG_CHILD, V_VAR3);
 MyMessage turnOffDelayMsg(CONFIG_CHILD, V_VAR4);
 
+Bounce debouncer = Bounce(); 
+Bounce button = Bounce(); 
+
 //width: 60in
 //height 44in
 //depth  27in
@@ -45,18 +52,19 @@ MyMessage turnOffDelayMsg(CONFIG_CHILD, V_VAR4);
 
 uint32_t loopTime;
 uint32_t lastSend;
-volatile uint32_t runTime;
-uint32_t waitTime;
+uint32_t runTime;
 uint32_t onDelay;
 uint32_t offDelay;
 uint32_t startTime;
 float    gph;
 bool     forceSend;
-bool update_runTime = false;
+uint32_t last_but;
+//bool update_runTime = false;
+bool last_heat;
 
 void presentation()
 {
-    sendSketchInfo("Oil Tank Sensor", "1.0");
+    sendSketchInfo("Oil Tank Sensor", "1.1");
     present(FURNACE_CHILD, S_GAS);
     present(CONFIG_CHILD, S_CUSTOM);
 }
@@ -97,7 +105,7 @@ float getGallons(uint32_t seconds)
 {
     return TANK_SIZE - (gph * seconds / 3600.0);
 }
-
+/*
 void stateChange()
 {
     bool state = digitalRead(HEAT_PIN) ? false : true;
@@ -105,16 +113,15 @@ void stateChange()
     if (state) {
         startTime = now;
     } else {
-        uint32_t delta = (now + 500 - startTime) / 1000;
+        uint32_t delta = (now + 500L - startTime) / 1000L;
         if (delta > onDelay)
-            runTime += delta + offDelay - onDelay;
+            runTime += delta + (uint32_t)offDelay - (uint32_t)onDelay;
             update_runTime = true;
     }
 }
-
+*/
 void setup()
 {
-    update_runTime = false;
     loopTime  = (loadState(EEPROM_LOOPTIME) << 8) | loadState(EEPROM_LOOPTIME + 1);
     if (loopTime == 65535L || loopTime == 0) {
         loopTime = updateEEPROM16(EEPROM_LOOPTIME, 20);
@@ -138,40 +145,60 @@ void setup()
         runTime = updateEEPROM24(EEPROM_RUNTIME, 0); 
     }
     pinMode(HEAT_PIN, INPUT_PULLUP);
-    attachInterrupt(digitalPinToInterrupt(HEAT_PIN), stateChange, CHANGE);
-    stateChange(); //Force initialization
+    debouncer.attach(HEAT_PIN);
+    debouncer.interval(15);
+    pinMode(BUTTON_PIN, INPUT_PULLUP);
+    button.attach(BUTTON_PIN);
+    button.interval(5);
     forceSend = true;
     lastSend = 0;
+    startTime = millis();
+    last_heat = 0;
+    last_but = 0;
 }
 
 void loop()
 {
     unsigned long now = millis();
+    debouncer.update();
+    button.update();
     bool sendTime = now - lastSend > loopTime;
+    bool heat = debouncer.read() ? false : true;
+    bool but = button.read() ? false : true;
+    if (heat != last_heat) {
+        if (heat) {
+            startTime = now;
+        } else {
+            uint32_t delta = (now + 500L - startTime) / 1000L;
+            if (delta > onDelay) {
+                runTime += delta + (uint32_t)offDelay - (uint32_t)onDelay;
+                updateEEPROM24(EEPROM_RUNTIME, runTime);                      
+            }
+        }
+        forceSend = true;
+        last_heat = heat;
+    }
+    if (but) {
+        if(now - last_but > BUTTON_HOLD_TIME) {
+            runTime = 0;  //reset tank to full
+            updateEEPROM24(EEPROM_RUNTIME, runTime); 
+            forceSend = true;
+            last_but = now;
+        }
+    } else {
+        last_but = now;
+    }
     if (sendTime || forceSend) {
-        uint32_t local_runTime;
-        uint32_t local_startTime;
-        bool local_updateRunTime;
-        bool local_state = digitalRead(3) ? false : true;
-        {
-            ATOMIC_BLOCK(ATOMIC_RESTORESTATE);
-            local_runTime = runTime;
-            local_startTime = startTime;
-            local_updateRunTime = update_runTime;
-            update_runTime = false;
-        }
-        if (local_updateRunTime) {
-            updateEEPROM24(EEPROM_RUNTIME, local_runTime);                      
-        }
-        if (local_state) {
-          uint32_t delta = (now + 500L - local_startTime) / 1000L;
+        uint32_t local_runTime = runTime;
+        if (heat) {
+          uint32_t delta = (now + 500L - startTime) / 1000L;
           if (delta > onDelay) {
               local_runTime += delta - onDelay;
           }
         }
         send(gallonsMsg.set(getGallons(local_runTime), 3));
         send(runtimeMsg.set(local_runTime));
-        send(stateMsg.set(local_state));
+        send(stateMsg.set(heat));
         if (forceSend) {
             send(loopTimeMsg.set(loopTime/1000L));
             send(gphMsg.set(gph, 3));
