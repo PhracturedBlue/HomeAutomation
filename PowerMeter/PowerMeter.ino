@@ -1,5 +1,6 @@
 //#define MY_DEBUG 1
 #define MY_NODE_ID 5
+#define MY_TRANSPORT_WAIT_READY_MS 3000UL
 #define MY_RADIO_RFM69
 #define MY_RFM69_FREQUENCY   RF69_433MHZ
 //#define MY_BAUD_RATE 9600
@@ -44,6 +45,7 @@ volatile unsigned long pulseCount = 0;
 volatile unsigned long lastBlink = 0;
 volatile unsigned long interval = 0;
 volatile unsigned long sumInterval = 0;
+volatile unsigned long maxInterval = 0;
 volatile unsigned long runningCount = 0;
 volatile bool newPulse = false;
 volatile bool doReset = true;
@@ -59,7 +61,7 @@ OneWire oneWire(ONE_WIRE_BUS);
 
 MyMessage wattMsg(POWER_CHILD,V_WATT);
 MyMessage kwhMsg(POWER_CHILD,V_KWH);
-MyMessage pcMsg(POWER_CHILD,V_VAR1);
+MyMessage maxWattMsg(POWER_CHILD,V_VAR1);
 MyMessage kwhHistoryMsg(POWER_CHILD,V_VAR2);
 
 MyMessage tempMsg(TEMP_CHILD, V_TEMP);
@@ -132,13 +134,22 @@ void reset_kwh(bool save)
     rtc.writeRam(RAM_DAY, currentDay);
     forceSend = true;
 }
+
+void send_time()
+{
+            Time t = rtc.time();
+            char tmp[20];
+            sprintf(tmp, "%4d-%02d-%02d %02d:%02d:%02d (%d)", t.yr, t.mon, t.date, t.hr, t.min, t.sec, t.day);
+            Serial.println(tmp);
+            send(rtcTimeMsg.set(tmp));
+}
+
 void setup()
 {
     loopTime  = (loadState(EEPROM_LOOPTIME) << 8) | loadState(EEPROM_LOOPTIME + 1);
     if (loopTime == 65535 || loopTime == 0)
         loopTime = updateEEPROM(EEPROM_LOOPTIME, 20);
     loopTime = loopTime * 1000;
-
     // Fetch last known pulse count value from gw
     //request(CHILD_ID, V_VAR1);
 
@@ -156,7 +167,7 @@ void setup()
     // Use the internal pullup to be able to hook up this sketch directly to an energy meter with S0 output
     // If no pullup is used, the reported usage will be too high because of the floating pin
     pinMode(IR_SENSOR_PIN,INPUT_PULLUP);
-
+    send_time();
     attachInterrupt(digitalPinToInterrupt(IR_SENSOR_PIN), onPulse, RISING);
     lastSend=0;
 }
@@ -191,14 +202,17 @@ void loop()
         reset_kwh(true);
     }
     if (sendTime || forceSend) {
-        unsigned long localInterval;
+//        unsigned long localInterval;
+        unsigned long localMaxInterval;
         unsigned long localSumInterval;
         unsigned long localRunningCount;
         unsigned long watt;
+        unsigned long maxWatt;
         {
             ATOMIC_BLOCK(ATOMIC_RESTORESTATE);
             localSumInterval = sumInterval;
-            localInterval = interval;
+//            localInterval = interval;
+            localMaxInterval = maxInterval;
             localRunningCount = runningCount;
             localPulseCount = pulseCount;
             doReset = true;
@@ -209,9 +223,11 @@ void loop()
 
         if (localPulseCount == oldPulseCount || localRunningCount == 0) {
             watt = 0;
+            maxWatt = 0;
         } else {
             //watt = (3600000000.0 /localInterval) / ppwh;
             watt = (3600000000.0 / (localSumInterval / localRunningCount)) / ppwh;
+            maxWatt = (3600000000.0 / localMaxInterval) / ppwh;
         }
 
         // New watt value has been calculated
@@ -221,14 +237,17 @@ void loop()
             if (watt<((unsigned long)MAX_WATT)) {
                 send(wattMsg.set(watt));  // Send watt value to gw
             }
-            Serial.print("Watt:");
-            Serial.println(watt);
+            if (maxWatt<((unsigned long)MAX_WATT)) {
+                send(maxWattMsg.set(maxWatt));  // Send watt value to gw
+            }
+            //Serial.print("Watt:");
+            //Serial.println(watt);
         }
 
         // Pulse cout has changed
         {
             double kwh = ((double)localPulseCount/((double)PULSE_FACTOR));
-            send(pcMsg.set(localPulseCount));  // Send pulse count value to gw
+            //send(pcMsg.set(localPulseCount));  // Send pulse count value to gw
             send(kwhMsg.set(kwh, 4));  // Send kwh value to gw
             oldPulseCount = localPulseCount;
             send(tempMsg.set(temp, 2));
@@ -244,9 +263,10 @@ void loop()
 void receive(const MyMessage &message)
 {
     if (message.sensor == POWER_CHILD) {
-        if (message.type==V_VAR1) {
+        if (message.type==V_KWH) {
             // Update/ report pulse-count
-            long pc = message.getLong();
+            double kwh = message.getFloat();
+            long pc = kwh * ((double)PULSE_FACTOR);
             if (pc >= 0) {
                 oldPulseCount = pc;
                 {
@@ -256,10 +276,11 @@ void receive(const MyMessage &message)
                 write_kwh(oldPulseCount);
                 Serial.print("Received last pulse count from gw:");
             } else {
-                ATOMIC_BLOCK(ATOMIC_RESTORESTATE);
                 pc = oldPulseCount;
             }
-            send(pcMsg.set(pc));
+            kwh = ((double)pc/((double)PULSE_FACTOR));
+            //send(pcMsg.set(localPulseCount));  // Send pulse count value to gw
+            send(kwhMsg.set(kwh, 4));  // Send kwh value to gw
             Serial.println(pc);
         }
         if (message.type==V_VAR2) {
@@ -276,7 +297,9 @@ void receive(const MyMessage &message)
     if (message.sensor == CONFIG_CHILD) {
         if (message.type == V_VAR1) {
             unsigned long value = atoi(message.data);
-            loopTime = (unsigned long)updateEEPROM(EEPROM_LOOPTIME, value) * 1000;
+            if (value >= 5) {
+                loopTime = (unsigned long)updateEEPROM(EEPROM_LOOPTIME, value) * 1000;
+            }
             send(loopTimeMsg.set(loopTime/1000));
         }
         if (message.type == V_VAR2) {
@@ -297,11 +320,7 @@ void receive(const MyMessage &message)
                 Time t(val[0]+2000, val[1], val[2], val[3], val[4], val[5], val[6]);
                 rtc.time(t);
             }
-            Time t = rtc.time();
-            char tmp[20];
-            sprintf(tmp, "%4d-%02d%-02d %02d:%02d:%02d (%d)", t.yr, t.mon, t.date, t.hr, t.min, t.sec, t.day);
-            Serial.println(tmp);
-            send(rtcTimeMsg.set(tmp));
+            send_time();
         }
     }
     forceSend = true;
@@ -314,12 +333,15 @@ void onPulse()
         if (doReset) {
             runningCount = 0;
             sumInterval = 0;
+            maxInterval = 0;
             doReset = false;
         }
         interval = newBlink-lastBlink;
         if (interval<10000L) { // Sometimes we get interrupt on RISING
             return;
         }
+        if (maxInterval == 0 || interval < maxInterval)
+            maxInterval = interval;
         sumInterval += interval;
         runningCount++;
         lastBlink = newBlink;
