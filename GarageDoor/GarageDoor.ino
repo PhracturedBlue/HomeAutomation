@@ -5,13 +5,14 @@
  *  
  *  The sketch uses a 433MHz RFM69HW connected to a MapleMini board
  */
+#define MY_TRANSPORT_WAIT_READY_MS 3000UL
 #define MY_RADIO_RFM69
 #define MY_BAUD_RATE 9600
 #define MY_RF69_IRQ_PIN PA1
 #define MY_RFM69_FREQUENCY   RF69_433MHZ
 #define MY_RF69_SPI_CS PA4
 //#define MY_IS_RFM69HW 1
-#define MY_DEBUG 1
+//#define MY_DEBUG 1
 
   
 //#define BUTTON_PIN   PB8
@@ -41,12 +42,18 @@ enum {
   CLOSE = 0,
   OPEN = 1,
 };
+
+enum {
+  SLEEPING,
+  INTERRUPTED,
+  AWAKE,
+};
+
 MyMessage door1Msg(DOOR1_CHILD, V_STATUS);
 MyMessage door2Msg(DOOR2_CHILD, V_STATUS);
 MyMessage loopTimeMsg(CONFIG_CHILD, V_VAR1);
 MyMessage waitTimeMsg(CONFIG_CHILD, V_VAR2);
 MyMessage tempMsg(TEMP_CHILD, V_TEMP);
-
 // Setup a oneWire instance to communicate with any OneWire devices (not just Maxim/Dallas temperature ICs)
 OneWire oneWire(ONE_WIRE_BUS);
 // Pass our oneWire reference to Dallas Temperature. 
@@ -56,7 +63,13 @@ DallasTemperature sensors(&oneWire);
 uint32_t loopTime;
 uint32_t lastChange;
 uint32_t waitTime;
+uint32_t lastLoop;
 
+bool lastDoor1 = true;
+bool lastDoor2 = true;
+int wasSleeping = INTERRUPTED;
+
+/*
 void wait(const uint8_t interrupt1, const uint8_t mode1,
           const uint8_t interrupt2, const uint8_t mode2,
           const uint32_t waitingMS)
@@ -68,12 +81,19 @@ void wait(const uint8_t interrupt1, const uint8_t mode1,
     attachInterrupt(interrupt1, wakeUp1, (ExtIntTriggerMode)mode1);
     attachInterrupt(interrupt2, wakeUp2, (ExtIntTriggerMode)mode2);
     interrupts();
-    while (! interruptWakeUp() && hwMillis() - enteringMS < waitingMS) {
+    while ((! interruptWakeUp()) && hwMillis() - enteringMS < waitingMS) {
         _process();
     }
+    if (interrupt1 != INVALID_INTERRUPT_NUM) {
+        detachInterrupt(interrupt1);
+    }
+    if (interrupt2 != INVALID_INTERRUPT_NUM) {
+        detachInterrupt(interrupt2);
+    }
+
     _wokeUpByInterrupt = INVALID_INTERRUPT_NUM;
 }
-
+*/
 void presentation()
 {
     sendSketchInfo("Garage Door Sensor", "1.0");
@@ -98,14 +118,14 @@ void closeDoor(int door)
     //Serial.print("Closing ");
     //Serial.println(door == RELAY1_PIN ? "Door1" : "Door2");
     digitalWrite(door, LOW);
-    wait(500);
+    delay(500);
     digitalWrite(door, HIGH);
     lastChange = millis();
 }
 
 void setup()
 {
-    lastChange = 0;
+    lastChange = millis();
     loopTime  = (loadState(EEPROM_LOOPTIME) << 8) | loadState(EEPROM_LOOPTIME + 1);
     if (loopTime == 65535 || loopTime == 0)
         loopTime = updateEEPROM(EEPROM_LOOPTIME, 10);
@@ -121,37 +141,57 @@ void setup()
     pinMode(DOOR1_PIN, INPUT_PULLUP);
     pinMode(DOOR2_PIN, INPUT_PULLUP);
     sensors.begin();
+    send(loopTimeMsg.set(loopTime/1000));
+    send(waitTimeMsg.set(waitTime/1000));
 }
 
 void loop()
 {
-    static int count = 0;
     //Signal loop start
-    for (int i = 0; i < 6; i++) {
-      digitalWrite(PB1, i & 0x01 ? LOW : HIGH);
-      wait(100);
-    }
-    sensors.requestTemperatures();
-    float temp = sensors.getTempFByIndex(0);
+    uint32_t now = millis();
     bool door1 = digitalRead(DOOR1_PIN);
     bool door2 = digitalRead(DOOR2_PIN);
-    
-    //Serial.print("Door1: ");
-    //Serial.print(door1 ? "Open" : "Closed");
-    //Serial.print(" Door2: ");
-    //Serial.print(door2 ? "Open" : "Closed");
-    //Serial.print(" Temp: ");
-    //Serial.println(temp);
-    send(door1Msg.set(door1));
-    send(door2Msg.set(door2));
-    send(tempMsg.set(temp, 2));
-    if(count == 0) {
-        send(loopTimeMsg.set(loopTime/1000));
-        send(waitTimeMsg.set(waitTime/1000));
+    if (wasSleeping != AWAKE) {
+        // Can't trust timer
+        lastLoop = now;
     }
-    count = (count + 1) % 10;
-    //wait(DOOR1_PIN, CHANGE, DOOR2_PIN, CHANGE, loopTime);
-    sleep(DOOR1_PIN, CHANGE, DOOR2_PIN, CHANGE, loopTime, true);
+    bool display = ((wasSleeping != AWAKE) || (now - lastLoop > loopTime));
+    bool change  = (door1 != lastDoor1 || door2 != lastDoor2);
+    //This needs to be computed before we reset lastLoop;
+    bool shouldSleep = (!door1 && !door2 && !change && (wasSleeping == SLEEPING || now - lastLoop > loopTime));
+    if (display || change) {
+        lastLoop = now;
+        lastDoor1 = door1;
+        lastDoor2 = door2;
+        int count = wasSleeping == SLEEPING ? 6 : (wasSleeping == INTERRUPTED ? 8 : 10);
+        for (int i = 0; i < count; i++) {
+           digitalWrite(PB1, i & 0x01 ? LOW : HIGH);
+           wait(100);
+        }
+        sensors.requestTemperatures();
+        float temp = sensors.getTempFByIndex(0);
+    
+        //Serial.print("Door1: ");
+        //Serial.print(door1 ? "Open" : "Closed");
+        //Serial.print(" Door2: ");
+        //Serial.print(door2 ? "Open" : "Closed");
+        //Serial.print(" Temp: ");
+        //Serial.println(temp);
+        send(door1Msg.set(door1));
+        send(door2Msg.set(door2));
+        send(tempMsg.set(temp, 2));
+        //if (shouldSleep) {
+        //    if (sleep(DOOR1_PIN, CHANGE, DOOR2_PIN, CHANGE, loopTime, false) < 0) {
+        //        //timer wake-up
+        //        wasSleeping = SLEEPING;
+        //    } else {
+        //         //interrupt wakeup
+        //         wasSleeping = INTERRUPTED;
+        //    }
+        //} else {
+            wasSleeping = AWAKE;
+        //}
+    }
 }
 
 void receive(const MyMessage &message)
@@ -160,12 +200,14 @@ void receive(const MyMessage &message)
     if (message.sensor == CONFIG_CHILD) {
         if (message.type == V_VAR1) {
             int value = atoi(message.data);
-            loopTime = updateEEPROM(EEPROM_LOOPTIME, value) * 1000;
+            if (value > 0)
+                loopTime = updateEEPROM(EEPROM_LOOPTIME, value) * 1000;
             send(loopTimeMsg.set(loopTime/1000));
         }
         if (message.type == V_VAR2) {
             int value = atoi(message.data);
-            waitTime = updateEEPROM(EEPROM_WAITTIME, value) * 1000;
+            if (value >= 0)
+                waitTime = updateEEPROM(EEPROM_WAITTIME, value) * 1000;
             send(waitTimeMsg.set(waitTime/1000));
         }
     } else if (message.sensor == DOOR1_CHILD && message.type == V_STATUS) {
