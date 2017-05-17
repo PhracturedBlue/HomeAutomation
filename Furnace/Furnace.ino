@@ -12,10 +12,14 @@
 //#define MY_RF69_SPI_CS PA4
 //#define MY_IS_RFM69HW 1
 //#define MY_DEBUG 1
+#define MY_TRANSPORT_WAIT_READY_MS 3000
 
   
 //#define BUTTON_PIN   PB8
-#define HEAT_PIN     3
+#define AUXHEAT_PIN  3   //WHITE
+#define FAN_PIN      5   //GREEN
+#define HEATPUMP_PIN 6   //YELLOW
+#define COOL_PIN     7   //ORANGE
 #define BUTTON_PIN   4
 
 #include <MySensors.h>
@@ -33,16 +37,28 @@
 
 #define BUTTON_HOLD_TIME 5000 //5sec
 
+enum {
+   AUXHEAT  = 0,
+   FAN      = 1,
+   HEATPUMP = 2,
+   COOL     = 3,
+};
 
-MyMessage stateMsg(FURNACE_CHILD, V_STATUS);
-MyMessage gallonsMsg(FURNACE_CHILD, V_VOLUME);
-MyMessage runtimeMsg(FURNACE_CHILD, V_VAR1);
+//AC->DC conversion: must not see a high signal for this many msec to consider signal low
+#define FURNACE_FREQ 100
+#define MIN_COUNT    50
+
+MyMessage auxHeatMsg (FURNACE_CHILD, V_STATUS);
+MyMessage gallonsMsg (FURNACE_CHILD, V_VOLUME);
+MyMessage runtimeMsg (FURNACE_CHILD, V_VAR1);
+MyMessage fanMsg     (FURNACE_CHILD, V_VAR2);
+MyMessage heatpumpMsg(FURNACE_CHILD, V_VAR3);
+MyMessage coolMsg    (FURNACE_CHILD, V_VAR4);
 MyMessage loopTimeMsg(CONFIG_CHILD, V_VAR1);
 MyMessage gphMsg(CONFIG_CHILD, V_VAR2);
 MyMessage turnOnDelayMsg(CONFIG_CHILD, V_VAR3);
 MyMessage turnOffDelayMsg(CONFIG_CHILD, V_VAR4);
 
-Bounce debouncer = Bounce(); 
 Bounce button = Bounce(); 
 
 //width: 60in
@@ -50,7 +66,11 @@ Bounce button = Bounce();
 //depth  27in
 #define TANK_SIZE 275
 
+uint8_t  furnace_state;
+uint8_t  last_furnace_state;
 uint32_t loopTime;
+uint32_t lastSignal[4];
+uint8_t  lastCount[4];
 uint32_t lastSend;
 uint32_t runTime;
 uint32_t onDelay;
@@ -60,7 +80,8 @@ float    gph;
 bool     forceSend;
 uint32_t last_but;
 //bool update_runTime = false;
-bool last_heat;
+
+void updateFurnaceState();
 
 void presentation()
 {
@@ -144,29 +165,34 @@ void setup()
     if (runTime == 0 || runTime == 0xfffff) {
         runTime = updateEEPROM24(EEPROM_RUNTIME, 0); 
     }
-    pinMode(HEAT_PIN, INPUT_PULLUP);
-    debouncer.attach(HEAT_PIN);
-    debouncer.interval(15);
-    pinMode(BUTTON_PIN, INPUT_PULLUP);
+    pinMode(AUXHEAT_PIN,  INPUT);
+    pinMode(FAN_PIN,      INPUT);
+    pinMode(HEATPUMP_PIN, INPUT);
+    pinMode(COOL_PIN,     INPUT);
+    pinMode(BUTTON_PIN,   INPUT_PULLUP);
     button.attach(BUTTON_PIN);
     button.interval(5);
+    furnace_state = 0;
+    for(int i = 0; i < 4; i++) {
+        lastSignal[i] = 0;
+        lastCount[i]  = 0;
+    }
     forceSend = true;
     lastSend = 0;
     startTime = millis();
-    last_heat = 0;
     last_but = 0;
 }
 
 void loop()
 {
     unsigned long now = millis();
-    debouncer.update();
+    updateFurnaceState();
     button.update();
     bool sendTime = now - lastSend > loopTime;
-    bool heat = debouncer.read() ? false : true;
     bool but = button.read() ? false : true;
-    if (heat != last_heat) {
-        if (heat) {
+    if ((furnace_state ^ last_furnace_state) & (1 << AUXHEAT)) {
+        //auxHeat state changed
+        if (furnace_state & (1 << AUXHEAT)) {
             startTime = now;
         } else {
             uint32_t delta = (now + 500L - startTime) / 1000L;
@@ -176,7 +202,10 @@ void loop()
             }
         }
         forceSend = true;
-        last_heat = heat;
+        last_furnace_state = furnace_state;
+    } else if (furnace_state ^ last_furnace_state) {
+        forceSend = true;
+        last_furnace_state = furnace_state;
     }
     if (but) {
         if(now - last_but > BUTTON_HOLD_TIME) {
@@ -190,15 +219,19 @@ void loop()
     }
     if (sendTime || forceSend) {
         uint32_t local_runTime = runTime;
-        if (heat) {
+        if (furnace_state & (1 << AUXHEAT)) {
           uint32_t delta = (now + 500L - startTime) / 1000L;
           if (delta > onDelay) {
               local_runTime += delta - onDelay;
           }
         }
-        send(gallonsMsg.set(getGallons(local_runTime), 3));
-        send(runtimeMsg.set(local_runTime));
-        send(stateMsg.set(heat));
+        send(gallonsMsg.set (getGallons(local_runTime), 3));
+        send(runtimeMsg.set (local_runTime));
+        send(auxHeatMsg.set ((furnace_state & (1 << AUXHEAT))  ? 1 : 0));
+        send(fanMsg.set     ((furnace_state & (1 << FAN))      ? 1 : 0));
+        send(heatpumpMsg.set((furnace_state & (1 << HEATPUMP)) ? 1 : 0));
+        send(coolMsg.set    ((furnace_state & (1 << COOL))     ? 1 : 0));
+        
         if (forceSend) {
             send(loopTimeMsg.set(loopTime/1000L));
             send(gphMsg.set(gph, 3));
@@ -261,3 +294,41 @@ void receive(const MyMessage &message)
         }
     }
 }
+void updateSensor(uint8_t sensor, uint32_t now, uint8_t count) {
+    uint8_t pin;
+    switch (sensor) {
+        case AUXHEAT:  pin = AUXHEAT_PIN;  break;
+        case FAN:      pin = FAN_PIN;      break;
+        case HEATPUMP: pin = HEATPUMP_PIN; break;
+        case COOL:     pin = COOL_PIN;     break;
+        default: return;
+    }
+    //char data[256];
+    if (digitalRead(pin)) {
+        furnace_state |= (1 << sensor);
+        lastSignal[sensor] = now;
+        lastCount[sensor]  = count;
+        //sprintf(data,"+%d(%02x): %lu > %lu, %u > %u", sensor, furnace_state, now, lastSignal[sensor], (unsigned)count, (unsigned)lastCount[sensor]);
+        //Serial.println(data);
+    } else if (furnace_state & (1 << sensor)) {
+        if ((uint8_t)(count - lastCount[sensor]) > MIN_COUNT) {
+            lastCount[sensor]++; //Prevent wrap-around
+            if (now - lastSignal[sensor] > FURNACE_FREQ) {
+                furnace_state &= ~(1 << sensor);
+            }
+        }
+        //sprintf(data,"-%d(%02x): %lu > %lu, %u > %u", sensor, furnace_state, now, lastSignal[sensor], (unsigned)count, (unsigned)lastCount[sensor]);
+        //Serial.println(data);
+    }
+}
+void updateFurnaceState()
+{
+    static uint8_t count = 0;
+    uint32_t now = millis();
+    count++;
+    updateSensor(AUXHEAT,  now, count);
+    updateSensor(FAN,      now, count);
+    updateSensor(HEATPUMP, now, count);
+    updateSensor(COOL,     now, count);
+}
+
